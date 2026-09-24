@@ -1,0 +1,57 @@
+name: Revoke candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: Username GitHub du candidat
+        required: true
+        type: string
+      remove_collaborator:
+        description: Retirer le collaborateur du repo
+        required: true
+        type: boolean
+        default: true
+      delete_codespaces:
+        description: Supprimer ses Codespaces facturés à l'orga
+        required: true
+        type: boolean
+        default: true
+
+# Optionnel : limiter qui peut lancer (en plus de l'environment)
+# jobs.revoke.if: contains(fromJSON('["ncaringi","autre-owner"]'), github.actor)
+
+jobs:
+  revoke:
+    runs-on: ubuntu-latest
+    environment: cleanup
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.CANDIDATE_CLEANUP_TOKEN }}
+      ORG: GeorgesTech
+      REPO: GeorgesTech/promocode-test-technique-dev
+      USERNAME: ${{ inputs.username }}
+
+    steps:
+      - name: Check token
+        run: gh auth status
+
+      - name: Remove collaborator
+        if: inputs.remove_collaborator
+        run: |
+          gh api --method DELETE "repos/${REPO}/collaborators/${USERNAME}" \
+            || echo "Pas collaborateur (ou déjà retiré)"
+
+      - name: List codespaces
+        if: inputs.delete_codespaces
+        run: gh codespace list --org "$ORG" --user "$USERNAME" || true
+
+      - name: Delete codespaces billed to org
+        if: inputs.delete_codespaces
+        run: |
+          gh codespace delete \
+            --org "$ORG" \
+            --user "$USERNAME" \
+            --all \
+            --force
