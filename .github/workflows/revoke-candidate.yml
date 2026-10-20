@@ -1,0 +1,487 @@
+# Révoque un candidat après le test technique :
+#   1. inspecter l'état réel (compte, orga, collab, invitation, codespaces)
+#   2. supprimer ses Codespaces facturés à l'orga
+#   3. retirer l'accès repo (candidat + invitation pending)
+#
+# Ordre volontaire : suppression des codespaces AVANT suppression du candidat.
+# Une fois l'accès repo révoqué, les listings scopés à l'utilisateur
+# ne montrent plus ses codespaces — on les raterait.
+# Si cette suppression échoue, le retrait du candidat a quand même lieu
+# et le lanceur est averti (le workflow reste en échec).
+#
+# Token attendu : CANDIDATE_CLEANUP_TOKEN, owner actif de l'orga (admin:org + accès repo).
+# Un 404 « pas membre » n'est accepté que si ce token est un owner : sinon GitHub
+# répond aussi 404 pour un membre privé.
+# Lancer uniquement via workflow_dispatch.
+
+name: Revoke candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: Username GitHub du candidat
+        required: true
+        type: string
+      remove_collaborator:
+        description: Retirer le candidat du repo
+        required: true
+        type: boolean
+        default: true
+      delete_codespaces:
+        description: Supprimer ses Codespaces facturés à l'orga
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  revoke:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.CANDIDATE_CLEANUP_TOKEN }}
+      ORG: GeorgesTech
+      REPO: GeorgesTech/promocode-test-technique-dev
+      USERNAME: ${{ inputs.username }}
+      REMOVE_COLLABORATOR: ${{ inputs.remove_collaborator }}
+      DELETE_CODESPACES: ${{ inputs.delete_codespaces }}
+      ACTOR: ${{ github.actor }}
+
+    steps:
+      # Allowlist à faire évoluer pour contenir l'ensemble des devs Indy
+      - name: Check caller is authorized
+        if: ${{ !contains(fromJSON('["ncaringi"]'), github.actor) }}
+        run: |
+          echo "::error::${ACTOR} n'est pas autorisé à lancer ce workflow"
+          exit 1
+
+      # `gh auth status` : vérifie que GH_TOKEN est accepté par l'API pour pouvoir run la suite des steps.
+      - name: Check token
+        run: gh auth status
+
+      # Lecture seule + garde-fous. Rien n'est encore supprimé ici.
+      - name: Validate inputs and inspect candidate
+        id: inspect
+        run: |
+          # -e : stoppe au premier échec
+          # -u : variable non définie = erreur
+          # -o pipefail : un pipe échoue si n'importe quelle commande du pipe échoue
+          set -euo pipefail
+
+          # Distingue "ressource absente" (OK / no-op) d'une vraie erreur API (401/403/5xx).
+          api_ok_or_not_found() {
+            local err="$1"
+            grep -Eqi 'HTTP 404|Not Found' "${err}"
+          }
+
+          # Normalise le champ dispatch : espaces, newline, "@login" collé par erreur.
+          USERNAME="$(printf '%s' "${USERNAME}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^@//')"
+          # GITHUB_ENV : visible par les steps suivants. GITHUB_OUTPUT : outputs de ce step.
+          echo "USERNAME=${USERNAME}" >> "${GITHUB_ENV}"
+          echo "username=${USERNAME}" >> "${GITHUB_OUTPUT}"
+
+          # `::group::` / `::endgroup::` : plie le bloc dans l'UI GitHub Actions.
+          echo "::group::Plan d'exécution"
+          echo "Lancé par           : ${ACTOR}"
+          echo "Candidat            : ${USERNAME}"
+          echo "Repo                : ${REPO}"
+          echo "Orga                : ${ORG}"
+          echo "Retirer collab      : ${REMOVE_COLLABORATOR}"
+          echo "Supprimer codespaces: ${DELETE_CODESPACES}"
+          echo "::endgroup::"
+
+          if [[ ! "${USERNAME}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
+            echo "::error::Username GitHub invalide: '${USERNAME}'"
+            exit 1
+          fi
+
+          # `${var,,}` = minuscules bash. Évite de se tirer une balle dans le pied (owner / soi-même).
+          if [[ "${USERNAME,,}" == "ncaringi" ]]; then
+            echo "::error::Refus: ${USERNAME} est un compte protégé, ce workflow ne le révoque pas."
+            exit 1
+          fi
+          if [[ "${USERNAME,,}" == "${ACTOR,,}" ]]; then
+            echo "::error::Refus: le lanceur ne peut pas se révoquer lui-même (${USERNAME})."
+            exit 1
+          fi
+
+          if [[ "${REMOVE_COLLABORATOR}" != "true" && "${DELETE_CODESPACES}" != "true" ]]; then
+            echo "::error::Rien à faire: retirer le candidat ET supprimer les codespaces sont à false."
+            exit 1
+          fi
+
+          # Combinaisons valides mais incomplètes : on prévient, on n'abort pas.
+          if [[ "${DELETE_CODESPACES}" != "true" && "${REMOVE_COLLABORATOR}" == "true" ]]; then
+            echo "::warning::Les Codespaces du candidat facturés à l'orga ne seront PAS supprimés."
+          fi
+
+          if [[ "${DELETE_CODESPACES}" == "true" && "${REMOVE_COLLABORATOR}" != "true" ]]; then
+            echo "::warning::L'accès au repo du candidat ne sera PAS supprimé."
+          fi
+
+          echo "::group::Compte GitHub"
+          err="$(mktemp)"
+          # GET /users/{username} — 200 si le compte existe, 404 sinon.
+          # stdout → JSON, stderr → fichier d'erreur pour inspecter le statut HTTP.
+          if ! user_json="$(gh api "users/${USERNAME}" 2>"${err}")"; then
+            echo "::error::Impossible de résoudre le compte '${USERNAME}'."
+            cat "${err}"
+            rm -f "${err}"
+            exit 1
+          fi
+          rm -f "${err}"
+          echo "${user_json}" | jq '{login, id, type, html_url}'
+          echo "::endgroup::"
+
+          # Un membre d'orga garde l'accès même sans collab repo : le "revoke" serait un faux positif.
+          # GitHub répond 404 à la fois pour « pas membre » et pour « membre privé vu par un non-owner ».
+          # On n'accepte donc un 404 qu'après avoir prouvé que le token est un owner actif,
+          # et seulement si les deux endpoints (memberships + members) répondent 404.
+          # curl sans -L : un 302 (token pas reconnu comme membre) n'est pas suivi jusqu'à un autre statut.
+          echo "::group::Appartenance à l'orga ${ORG}"
+
+          github_status() {
+            local method="$1"
+            local url="$2"
+            local body_file="$3"
+            local code
+            code="$(
+              curl -sS -o "${body_file}" -w "%{http_code}" \
+                -X "${method}" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -H "User-Agent: revoke-candidate-workflow" \
+                "${url}"
+            )" || true
+            printf '%s' "${code}"
+          }
+
+          token_body="$(mktemp)"
+          token_code="$(github_status GET "https://api.github.com/user" "${token_body}")"
+          if [[ "${token_code}" != "200" ]]; then
+            echo "::error::Impossible d'identifier le compte du token (HTTP ${token_code}). Arrêt : sans owner confirmé, un 404 membre serait ambigu."
+            cat "${token_body}"
+            rm -f "${token_body}"
+            exit 1
+          fi
+          token_login="$(jq -r '.login // empty' "${token_body}")"
+          rm -f "${token_body}"
+          if [[ -z "${token_login}" ]]; then
+            echo "::error::Le token n'a pas de login utilisateur. Arrêt."
+            exit 1
+          fi
+
+          owner_body="$(mktemp)"
+          owner_code="$(github_status GET "https://api.github.com/orgs/${ORG}/memberships/${token_login}" "${owner_body}")"
+          owner_role="$(jq -r '.role // empty' "${owner_body}" 2>/dev/null || true)"
+          owner_state="$(jq -r '.state // empty' "${owner_body}" 2>/dev/null || true)"
+          rm -f "${owner_body}"
+          if [[ "${owner_code}" != "200" || "${owner_role}" != "admin" || "${owner_state}" != "active" ]]; then
+            echo "::error::Le token (${token_login}) n'est pas un owner actif de ${ORG} (HTTP ${owner_code}, role=${owner_role:-inconnu}, state=${owner_state:-inconnu})."
+            echo "::error::Refus de continuer : un membre privé répondrait 404 et pourrait être traité comme un candidat."
+            exit 1
+          fi
+          echo "Token ${token_login} : owner actif de ${ORG}."
+
+          membership_body="$(mktemp)"
+          membership_code="$(github_status GET "https://api.github.com/orgs/${ORG}/memberships/${USERNAME}" "${membership_body}")"
+          if [[ "${membership_code}" == "200" ]]; then
+            echo "${membership_body}" | jq '{state, role}'
+            state="$(jq -r '.state' "${membership_body}")"
+            role="$(jq -r '.role' "${membership_body}")"
+            echo "::error::${USERNAME} est ${role} (${state}) de ${ORG}. Ce n'est pas un candidat outside collaborator — abort."
+            rm -f "${membership_body}"
+            exit 1
+          elif [[ "${membership_code}" != "404" ]]; then
+            echo "::error::Appartenance orga ambiguë pour ${USERNAME} (HTTP ${membership_code}). Arrêt sans rien retirer."
+            cat "${membership_body}"
+            rm -f "${membership_body}"
+            exit 1
+          fi
+          rm -f "${membership_body}"
+
+          # 204 = membre, 404 = absent, 302 = le token n'est pas traité comme membre de l'orga.
+          members_body="$(mktemp)"
+          members_code="$(github_status GET "https://api.github.com/orgs/${ORG}/members/${USERNAME}" "${members_body}")"
+          rm -f "${members_body}"
+          if [[ "${members_code}" == "204" ]]; then
+            echo "::error::${USERNAME} est membre de ${ORG} (HTTP 204). Abort."
+            exit 1
+          elif [[ "${members_code}" != "404" ]]; then
+            echo "::error::Vérification membre ambiguë pour ${USERNAME} (HTTP ${members_code}). Arrêt sans rien retirer."
+            exit 1
+          fi
+
+          echo "${USERNAME} n'est pas membre de ${ORG} (memberships=404 et members=404, token owner)."
+          echo "::endgroup::"
+
+          echo "::group::Accès au repo ${REPO}"
+          is_collaborator=false
+          err="$(mktemp)"
+          # GET /repos/{owner}/{repo}/collaborators/{username}/permission
+          # 200 + {permission, role_name} si collab, 404 sinon.
+          if perm_json="$(gh api "repos/${REPO}/collaborators/${USERNAME}/permission" 2>"${err}")"; then
+            echo "${perm_json}" | jq '{permission, role_name}'
+            is_collaborator=true
+          elif api_ok_or_not_found "${err}"; then
+            echo "${USERNAME} n'est pas candidat de ${REPO} (déjà retiré, ou jamais ajouté)."
+          else
+            echo "::error::Impossible de vérifier le droit candidat."
+            cat "${err}"
+            rm -f "${err}"
+            exit 1
+          fi
+          rm -f "${err}"
+          echo "is_collaborator=${is_collaborator}" >> "${GITHUB_OUTPUT}"
+          echo "::endgroup::"
+
+          # DELETE /collaborators n'annule pas une invite non acceptée.
+          echo "::group::Invitations en attente"
+          # GET /repos/{owner}/{repo}/invitations — tableau d'invites pending.
+          # --paginate : enchaîne les pages. --jq : extrait id / login / perms en TSV.
+          invite_ids="$(
+            gh api --paginate "repos/${REPO}/invitations" \
+              --jq '.[] | [.id, .invitee.login, .permissions] | @tsv'
+          )"
+          matched_invites=""
+          if [[ -n "${invite_ids}" ]]; then
+            while IFS=$'\t' read -r invite_id invitee perms; do
+              [[ -z "${invite_id}" ]] && continue
+              echo "invitation id=${invite_id} invitee=${invitee} permissions=${perms}"
+              if [[ "${invitee,,}" == "${USERNAME,,}" ]]; then
+                matched_invites+="${invite_id}"$'\n'
+              fi
+            done <<< "${invite_ids}"
+          fi
+          matched_invites="$(printf '%s' "${matched_invites}" | sed '/^$/d')"
+          if [[ -z "${matched_invites}" ]]; then
+            echo "Aucune invitation pending pour ${USERNAME}."
+          else
+            echo "Invitations à annuler pour ${USERNAME}: ${matched_invites}"
+            if [[ "${REMOVE_COLLABORATOR}" == "true" ]]; then
+              echo "Ces invitations seront annulées à l'étape suivante."
+            else
+              echo "::warning::Invitation pending non annulée (remove_collaborator=false): le candidat pourra encore accepter l'accès."
+            fi
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Codespaces facturés à ${ORG} pour ${USERNAME}"
+          # GET /orgs/{org}/codespaces — codespaces facturés à l'orga (membres ET outside collaborators).
+          # env.USERNAME : lu par jq depuis l'environnement (gh --jq ne prend pas --arg).
+          codespaces_json="$(
+            gh api --paginate "orgs/${ORG}/codespaces" \
+              --jq '.codespaces[]
+                    | select((.owner.login | ascii_downcase) == (env.USERNAME | ascii_downcase))
+                    | {name, state, owner: .owner.login, repo: .repository.full_name, billable: .billable_owner.login, last_used_at, created_at}'
+          )"
+          if [[ -z "${codespaces_json}" ]]; then
+            echo "Aucun codespace listé pour ${USERNAME}."
+            echo "codespace_count=0" >> "${GITHUB_OUTPUT}"
+          else
+            # jq -s : slurp les objets JSONL en un tableau pour l'affichage / le count.
+            echo "${codespaces_json}" | jq -s '.'
+            count="$(echo "${codespaces_json}" | jq -s 'length')"
+            echo "codespace_count=${count}" >> "${GITHUB_OUTPUT}"
+            echo "${count} codespace(s) trouvé(s)."
+          fi
+          echo "::endgroup::"
+
+          if [[ "${REMOVE_COLLABORATOR}" == "true" && "${is_collaborator}" != "true" && -z "${matched_invites}" ]]; then
+            echo "::warning::Aucun accès repo à retirer (ni candidat, ni invitation). Le retrait sera un no-op."
+          fi
+
+      # Doit rester avant "Remove collaborator" (voir commentaire d'en-tête).
+      # Un échec ici ne bloque pas le retrait : le step suivant ignore le success() implicite.
+      - name: Delete codespaces billed to org
+        if: inputs.delete_codespaces
+        run: |
+          set -euo pipefail
+
+          # Le step sort en erreur, mais le retrait du candidat suit quand même.
+          fail_codespaces() {
+            local reason="$1"
+            echo "::error::${reason}"
+            echo "CODESPACES_CLEANUP=failed" >> "${GITHUB_ENV}"
+            if [[ "${REMOVE_COLLABORATOR}" == "true" ]]; then
+              echo "::warning::Codespaces non supprimés pour ${USERNAME}. Le retrait du candidat a quand même lieu : l'accès à ${REPO} va être révoqué. Des Codespaces peuvent rester facturés à ${ORG}, à supprimer à la main."
+            else
+              echo "::warning::Codespaces non supprimés pour ${USERNAME}. Le retrait du candidat est désactivé : l'accès à ${REPO} reste en place."
+            fi
+            exit 1
+          }
+
+          rows="$(
+            gh api --paginate "orgs/${ORG}/codespaces" \
+              --jq '.codespaces[]
+                    | select((.owner.login | ascii_downcase) == (env.USERNAME | ascii_downcase))
+                    | [.name, .owner.login, .state, .repository.full_name, .billable_owner.login]
+                    | @tsv'
+          )" || fail_codespaces "Impossible de lister les Codespaces de ${ORG}."
+
+          if [[ -z "${rows}" ]]; then
+            echo "Rien à supprimer: aucun codespace pour ${USERNAME} dans ${ORG}."
+            exit 0
+          fi
+
+          failed=0
+          deleted=0
+          already_gone=0
+
+          while IFS=$'\t' read -r name owner state repo billable; do
+            [[ -z "${name}" ]] && continue
+            echo "::group::Suppression ${name}"
+            echo "owner=${owner} state=${state} repo=${repo} billable=${billable}"
+
+            # DELETE /orgs/{org}/members/{username}/codespaces/{codespace_name}
+            # Fonctionne aussi pour un outside collaborator.
+            # On utilise .owner.login renvoyé par l'API (casse réelle), pas l'input.
+            err="$(mktemp)"
+            if gh api --method DELETE "orgs/${ORG}/members/${owner}/codespaces/${name}" >/dev/null 2>"${err}"; then
+              echo "Supprimé."
+              deleted=$((deleted + 1))
+            elif grep -Eqi 'HTTP 404|Not Found' "${err}"; then
+              echo "Déjà absent (404) — on continue."
+              already_gone=$((already_gone + 1))
+            else
+              echo "::error::Échec suppression de ${name}"
+              cat "${err}"
+              failed=$((failed + 1))
+            fi
+            rm -f "${err}"
+            echo "::endgroup::"
+          done <<< "${rows}"
+
+          echo "Bilan codespaces: ${deleted} supprimé(s), ${already_gone} déjà absent(s), ${failed} échec(s)."
+
+          # Reliste : s'il reste un codespace au nom du candidat, la suppression n'a pas abouti.
+          leftover="$(
+            gh api --paginate "orgs/${ORG}/codespaces" \
+              --jq '.codespaces[]
+                    | select((.owner.login | ascii_downcase) == (env.USERNAME | ascii_downcase))
+                    | .name'
+          )" || fail_codespaces "Impossible de revérifier les Codespaces après suppression."
+          if [[ -n "${leftover}" || "${failed}" -ne 0 ]]; then
+            if [[ -n "${leftover}" ]]; then
+              echo "Codespaces encore présents après suppression:"
+              echo "${leftover}"
+            fi
+            fail_codespaces "Suppression des Codespaces incomplète (${failed} échec(s), ${deleted} supprimé(s), ${already_gone} déjà absent(s))."
+          fi
+
+          echo "Vérification OK: plus aucun codespace pour ${USERNAME} dans ${ORG}."
+
+      - name: Skip codespace deletion
+        if: ${{ !inputs.delete_codespaces }}
+        run: echo "Étape codespaces ignorée (delete_codespaces=false)."
+
+      # !cancelled() désactive le success() implicite : ce step part même si les Codespaces ont échoué.
+      # steps.inspect.outcome == success : pas de retrait si le garde-fou orga / login a échoué ou a été sauté.
+      - name: Remove collaborator and pending invitations
+        if: ${{ !cancelled() && inputs.remove_collaborator && steps.inspect.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${CODESPACES_CLEANUP:-}" == "failed" ]]; then
+            echo "::warning::Les Codespaces de ${USERNAME} n'ont pas été supprimés. Retrait du candidat quand même — des Codespaces peuvent rester facturés à ${ORG}."
+          fi
+
+          failed=0
+
+          # D'abord les invitations : un DELETE collaborators sur un user
+          # qui n'a pas encore accepté renvoie une erreur et laisse l'invite active.
+          echo "::group::Invitation(s) pending"
+          invite_rows="$(
+            gh api --paginate "repos/${REPO}/invitations" \
+              --jq '.[] | [.id, .invitee.login] | @tsv'
+          )"
+          cancelled=0
+          if [[ -z "${invite_rows}" ]]; then
+            echo "Aucune invitation sur le repo."
+          else
+            while IFS=$'\t' read -r invite_id invitee; do
+              [[ -z "${invite_id}" ]] && continue
+              if [[ "${invitee,,}" != "${USERNAME,,}" ]]; then
+                continue
+              fi
+              echo "Annulation invitation ${invite_id} (${invitee})"
+              # DELETE /repos/{owner}/{repo}/invitations/{invitation_id}.
+              err="$(mktemp)"
+              if gh api --method DELETE "repos/${REPO}/invitations/${invite_id}" >/dev/null 2>"${err}"; then
+                echo "Invitation ${invite_id} annulée."
+                cancelled=$((cancelled + 1))
+              elif grep -Eqi 'HTTP 404|Not Found' "${err}"; then
+                echo "Invitation ${invite_id} déjà absente."
+              else
+                echo "::error::Impossible d'annuler l'invitation ${invite_id}"
+                cat "${err}"
+                failed=$((failed + 1))
+              fi
+              rm -f "${err}"
+            done <<< "${invite_rows}"
+            if [[ "${cancelled}" -eq 0 && "${failed}" -eq 0 ]]; then
+              echo "Aucune invitation pending pour ${USERNAME}."
+            fi
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Retrait candidat"
+          # DELETE /repos/{owner}/{repo}/collaborators/{username}.
+          err="$(mktemp)"
+          if gh api --method DELETE "repos/${REPO}/collaborators/${USERNAME}" >/dev/null 2>"${err}"; then
+            echo "${USERNAME} retiré de ${REPO}."
+          elif grep -Eqi 'HTTP 404|Not Found' "${err}"; then
+            echo "${USERNAME} n'était pas candidat (404) — rien à retirer."
+          else
+            echo "::error::Échec du retrait candidat"
+            cat "${err}"
+            failed=$((failed + 1))
+          fi
+          rm -f "${err}"
+          echo "::endgroup::"
+
+          echo "::group::Vérification accès"
+          err="$(mktemp)"
+          if gh api "repos/${REPO}/collaborators/${USERNAME}/permission" >/dev/null 2>"${err}"; then
+            echo "::error::${USERNAME} a encore un droit sur ${REPO} après le retrait."
+            gh api "repos/${REPO}/collaborators/${USERNAME}/permission" --jq '{permission, role_name}' || true
+            failed=$((failed + 1))
+          elif grep -Eqi 'HTTP 404|Not Found' "${err}"; then
+            echo "OK: plus de permission candidat pour ${USERNAME}."
+          else
+            echo "::error::Impossible de re-vérifier le droit candidat."
+            cat "${err}"
+            failed=$((failed + 1))
+          fi
+          rm -f "${err}"
+
+          leftover_invites="$(
+            gh api --paginate "repos/${REPO}/invitations" \
+              --jq '.[] | [.id, .invitee.login] | @tsv'
+          )"
+          leftover_matched=0
+          if [[ -n "${leftover_invites}" ]]; then
+            while IFS=$'\t' read -r invite_id invitee; do
+              [[ -z "${invite_id}" ]] && continue
+              if [[ "${invitee,,}" == "${USERNAME,,}" ]]; then
+                echo "::error::Invitation encore pending: id=${invite_id}"
+                leftover_matched=$((leftover_matched + 1))
+              fi
+            done <<< "${leftover_invites}"
+          fi
+          if [[ "${leftover_matched}" -eq 0 ]]; then
+            echo "OK: plus d'invitation pending pour ${USERNAME}."
+          else
+            failed=$((failed + 1))
+          fi
+          echo "::endgroup::"
+
+          if [[ "${failed}" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Skip collaborator removal
+        if: ${{ !cancelled() && !inputs.remove_collaborator && steps.inspect.outcome == 'success' }}
+        run: echo "Étape candidat ignorée (remove_collaborator=false)."
