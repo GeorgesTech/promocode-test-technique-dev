@@ -188,7 +188,7 @@ jobs:
           membership_body="$(mktemp)"
           membership_code="$(github_status GET "https://api.github.com/orgs/${ORG}/memberships/${USERNAME}" "${membership_body}")"
           if [[ "${membership_code}" == "200" ]]; then
-            echo "${membership_body}" | jq '{state, role}'
+            jq '{state, role}' "${membership_body}"
             state="$(jq -r '.state' "${membership_body}")"
             role="$(jq -r '.role' "${membership_body}")"
             echo "::error::${USERNAME} est ${role} (${state}) de ${ORG}. Ce n'est pas un candidat outside collaborator — abort."
