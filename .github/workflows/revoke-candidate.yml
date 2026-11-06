@@ -220,10 +220,10 @@ jobs:
           echo "::group::Accès au repo ${REPO}"
           is_collaborator=false
           err="$(mktemp)"
-          # GET /repos/{owner}/{repo}/collaborators/{username}/permission
-          # 200 + {permission, role_name} si collab, 404 sinon.
-          if perm_json="$(gh api "repos/${REPO}/collaborators/${USERNAME}/permission" 2>"${err}")"; then
-            echo "${perm_json}" | jq '{permission, role_name}'
+          # GET /repos/{owner}/{repo}/collaborators/{username} — 204 si collab, 404 sinon.
+          # Pas /permission : il répond 200 même sans accès (permission "none", ou "read" si repo public).
+          if gh api "repos/${REPO}/collaborators/${USERNAME}" >/dev/null 2>"${err}"; then
+            gh api "repos/${REPO}/collaborators/${USERNAME}/permission" --jq '{permission, role_name}' || true
             is_collaborator=true
           elif api_ok_or_not_found "${err}"; then
             echo "${USERNAME} n'est pas candidat de ${REPO} (déjà retiré, ou jamais ajouté)."
@@ -444,7 +444,7 @@ jobs:
 
           echo "::group::Vérification accès"
           err="$(mktemp)"
-          if gh api "repos/${REPO}/collaborators/${USERNAME}/permission" >/dev/null 2>"${err}"; then
+          if gh api "repos/${REPO}/collaborators/${USERNAME}" >/dev/null 2>"${err}"; then
             echo "::error::${USERNAME} a encore un droit sur ${REPO} après le retrait."
             gh api "repos/${REPO}/collaborators/${USERNAME}/permission" --jq '{permission, role_name}' || true
             failed=$((failed + 1))
