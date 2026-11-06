@@ -357,12 +357,20 @@ jobs:
           echo "Bilan codespaces: ${deleted} supprimé(s), ${already_gone} déjà absent(s), ${failed} échec(s)."
 
           # Reliste : s'il reste un codespace au nom du candidat, la suppression n'a pas abouti.
-          leftover="$(
-            gh api --paginate "orgs/${ORG}/codespaces" \
-              --jq '.codespaces[]
-                    | select((.owner.login | ascii_downcase) == (env.USERNAME | ascii_downcase))
-                    | .name'
-          )" || fail_codespaces "Impossible de revérifier les Codespaces après suppression."
+          # Le DELETE répond 202 (asynchrone) : on laisse quelques essais avant de conclure.
+          for attempt in 1 2 3 4 5 6; do
+            leftover="$(
+              gh api --paginate "orgs/${ORG}/codespaces" \
+                --jq '.codespaces[]
+                      | select((.owner.login | ascii_downcase) == (env.USERNAME | ascii_downcase))
+                      | .name'
+            )" || fail_codespaces "Impossible de revérifier les Codespaces après suppression."
+            [[ -z "${leftover}" ]] && break
+            if [[ "${attempt}" -lt 6 ]]; then
+              echo "Codespaces encore listés (essai ${attempt}/6), nouvel essai dans 10s."
+              sleep 10
+            fi
+          done
           if [[ -n "${leftover}" || "${failed}" -ne 0 ]]; then
             if [[ -n "${leftover}" ]]; then
               echo "Codespaces encore présents après suppression:"
@@ -443,8 +451,22 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Vérification accès"
+          # Le retrait est propagé en arrière-plan : un 204 juste après le DELETE n'est pas définitif.
           err="$(mktemp)"
-          if gh api "repos/${REPO}/collaborators/${USERNAME}" >/dev/null 2>"${err}"; then
+          still_collaborator=false
+          for attempt in 1 2 3 4 5; do
+            if gh api "repos/${REPO}/collaborators/${USERNAME}" >/dev/null 2>"${err}"; then
+              still_collaborator=true
+            else
+              still_collaborator=false
+              break
+            fi
+            if [[ "${attempt}" -lt 5 ]]; then
+              echo "${USERNAME} encore listé comme candidat (essai ${attempt}/5), nouvel essai dans 5s."
+              sleep 5
+            fi
+          done
+          if [[ "${still_collaborator}" == "true" ]]; then
             echo "::error::${USERNAME} a encore un droit sur ${REPO} après le retrait."
             gh api "repos/${REPO}/collaborators/${USERNAME}/permission" --jq '{permission, role_name}' || true
             failed=$((failed + 1))
