@@ -52,12 +52,29 @@ jobs:
       RETRY_DELAY: 10
 
     steps:
-      # Allowlist à faire évoluer pour contenir l'ensemble des devs Indy
+      # Seuls les membres actifs de l'équipe GeorgesTech/developers peuvent lancer ce workflow.
       - name: Check caller is authorized
-        if: ${{ !contains(fromJSON('["ncaringi"]'), github.actor) }}
+        env:
+          AUTHORIZED_TEAM: developers
         run: |
-          echo "::error::${ACTOR} n'est pas autorisé à lancer ce workflow"
-          exit 1
+          set -euo pipefail
+          # GET /orgs/{org}/teams/{team_slug}/memberships/{username} — 200 + state, 404 si pas dans l'équipe.
+          # Une invitation non acceptée répond aussi 200 (state "pending") : on exige "active".
+          err="$(mktemp)"
+          if state="$(gh api "orgs/${ORG}/teams/${AUTHORIZED_TEAM}/memberships/${ACTOR}" --jq '.state' 2>"${err}")"; then
+            if [[ "${state}" != "active" ]]; then
+              echo "::error::${ACTOR} n'est pas membre actif de ${ORG}/${AUTHORIZED_TEAM} (state=${state})."
+              exit 1
+            fi
+            echo "${ACTOR} est membre actif de ${ORG}/${AUTHORIZED_TEAM}."
+          elif grep -Eqi 'HTTP 404|Not Found' "${err}"; then
+            echo "::error::${ACTOR} n'est pas autorisé à lancer ce workflow (hors équipe ${ORG}/${AUTHORIZED_TEAM})."
+            exit 1
+          else
+            echo "::error::Impossible de vérifier l'appartenance de ${ACTOR} à ${ORG}/${AUTHORIZED_TEAM}."
+            cat "${err}"
+            exit 1
+          fi
 
       # `gh auth status` : vérifie que GH_TOKEN est accepté par l'API pour pouvoir run la suite des steps.
       - name: Check token
