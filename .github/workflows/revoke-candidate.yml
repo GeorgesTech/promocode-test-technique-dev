@@ -345,6 +345,10 @@ jobs:
             elif grep -Eqi 'HTTP 404|Not Found' "${err}"; then
               echo "Déjà absent (404) — on continue."
               already_gone=$((already_gone + 1))
+            elif grep -Eq 'HTTP 304' "${err}"; then
+              # gh api sort en erreur sur un 304 ; la relecture ci-dessous tranche.
+              echo "Non modifié (304), suppression sans doute déjà en cours — on continue."
+              already_gone=$((already_gone + 1))
             else
               echo "::error::Échec suppression de ${name}"
               cat "${err}"
@@ -436,12 +440,10 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Retrait candidat"
-          # DELETE /repos/{owner}/{repo}/collaborators/{username}.
+          # DELETE /repos/{owner}/{repo}/collaborators/{username} — 204, sinon 403/422 (pas de 404 documenté).
           err="$(mktemp)"
           if gh api --method DELETE "repos/${REPO}/collaborators/${USERNAME}" >/dev/null 2>"${err}"; then
             echo "${USERNAME} retiré de ${REPO}."
-          elif grep -Eqi 'HTTP 404|Not Found' "${err}"; then
-            echo "${USERNAME} n'était pas candidat (404) — rien à retirer."
           else
             echo "::error::Échec du retrait candidat"
             cat "${err}"
