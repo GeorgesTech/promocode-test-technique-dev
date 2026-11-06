@@ -47,6 +47,9 @@ jobs:
       REMOVE_COLLABORATOR: ${{ inputs.remove_collaborator }}
       DELETE_CODESPACES: ${{ inputs.delete_codespaces }}
       ACTOR: ${{ github.actor }}
+      # Re-vérifications après suppressions asynchrones (codespaces, retrait candidat).
+      RETRY_MAX: 3
+      RETRY_DELAY: 10
 
     steps:
       # Allowlist à faire évoluer pour contenir l'ensemble des devs Indy
@@ -362,7 +365,7 @@ jobs:
 
           # Reliste : s'il reste un codespace au nom du candidat, la suppression n'a pas abouti.
           # Le DELETE répond 202 (asynchrone) : on laisse quelques essais avant de conclure.
-          for attempt in 1 2 3 4 5 6; do
+          for attempt in $(seq 1 "${RETRY_MAX}"); do
             leftover="$(
               gh api --paginate "orgs/${ORG}/codespaces" \
                 --jq '.codespaces[]
@@ -370,9 +373,9 @@ jobs:
                       | .name'
             )" || fail_codespaces "Impossible de revérifier les Codespaces après suppression."
             [[ -z "${leftover}" ]] && break
-            if [[ "${attempt}" -lt 6 ]]; then
-              echo "Codespaces encore listés (essai ${attempt}/6), nouvel essai dans 10s."
-              sleep 10
+            if [[ "${attempt}" -lt "${RETRY_MAX}" ]]; then
+              echo "Codespaces encore listés (essai ${attempt}/${RETRY_MAX}), nouvel essai dans ${RETRY_DELAY}s."
+              sleep "${RETRY_DELAY}"
             fi
           done
           if [[ -n "${leftover}" || "${failed}" -ne 0 ]]; then
@@ -456,16 +459,16 @@ jobs:
           # Le retrait est propagé en arrière-plan : un 204 juste après le DELETE n'est pas définitif.
           err="$(mktemp)"
           still_collaborator=false
-          for attempt in 1 2 3 4 5; do
+          for attempt in $(seq 1 "${RETRY_MAX}"); do
             if gh api "repos/${REPO}/collaborators/${USERNAME}" >/dev/null 2>"${err}"; then
               still_collaborator=true
             else
               still_collaborator=false
               break
             fi
-            if [[ "${attempt}" -lt 5 ]]; then
-              echo "${USERNAME} encore listé comme candidat (essai ${attempt}/5), nouvel essai dans 5s."
-              sleep 5
+            if [[ "${attempt}" -lt "${RETRY_MAX}" ]]; then
+              echo "${USERNAME} encore listé comme candidat (essai ${attempt}/${RETRY_MAX}), nouvel essai dans ${RETRY_DELAY}s."
+              sleep "${RETRY_DELAY}"
             fi
           done
           if [[ "${still_collaborator}" == "true" ]]; then
