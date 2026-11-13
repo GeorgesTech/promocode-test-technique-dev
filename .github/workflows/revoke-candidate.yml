@@ -9,9 +9,12 @@
 # Si cette suppression échoue, le retrait du candidat a quand même lieu
 # et le lanceur est averti (le workflow reste en échec).
 #
-# Token attendu : CANDIDATE_CLEANUP_TOKEN, owner actif de l'orga (admin:org + accès repo).
-# Un 404 « pas membre » n'est accepté que si ce token est un owner : sinon GitHub
-# répond aussi 404 pour un membre privé.
+# Token : généré à chaque run par la GitHub App indy-candidate-cleanup
+# (APP_ID_CANDIDATE_CLEANUP / PRIVATE_KEY_CANDIDATE_CLEANUP), installée sur ce repo seulement.
+# Permissions de l'App : repo administration + codespaces (write), org members (read)
+# + organization codespaces (write). Le token dure 1 h et est révoqué en fin de job.
+# Un 404 « pas membre » n'est accepté qu'après avoir prouvé que le token voit les
+# appartenances à l'orga (sinon GitHub répond aussi 404 pour un membre privé).
 # Lancer uniquement via workflow_dispatch.
 
 name: Revoke candidate
@@ -37,10 +40,9 @@ on:
 jobs:
   revoke:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    # Le GITHUB_TOKEN ne sert à rien ici : tout passe par le token de l'App.
+    permissions: {}
     env:
-      GH_TOKEN: ${{ secrets.CANDIDATE_CLEANUP_TOKEN }}
       ORG: GeorgesTech
       REPO: GeorgesTech/promocode-test-technique-dev
       USERNAME: ${{ inputs.username }}
@@ -52,9 +54,21 @@ jobs:
       RETRY_DELAY: 10
 
     steps:
+      # Token d'installation de l'App, limité à ce repo (+ ses permissions d'orga).
+      # Passé en GH_TOKEN à chaque step qui appelle l'API.
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.APP_ID_CANDIDATE_CLEANUP }}
+          private-key: ${{ secrets.PRIVATE_KEY_CANDIDATE_CLEANUP }}
+          owner: GeorgesTech
+          repositories: promocode-test-technique-dev
+
       # Seuls les membres actifs de l'équipe GeorgesTech/developers peuvent lancer ce workflow.
       - name: Check caller is authorized
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           AUTHORIZED_TEAM: developers
         run: |
           set -euo pipefail
@@ -76,13 +90,18 @@ jobs:
             exit 1
           fi
 
-      # `gh auth status` : vérifie que GH_TOKEN est accepté par l'API pour pouvoir run la suite des steps.
+      # Vérifie que le token d'App est accepté et voit le repo.
+      # Pas `gh auth status` : il appelle /user, qui n'existe pas pour un token d'App.
       - name: Check token
-        run: gh auth status
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh api "repos/${REPO}" --jq '"Token OK, accès à " + .full_name'
 
       # Lecture seule + garde-fous. Rien n'est encore supprimé ici.
       - name: Validate inputs and inspect candidate
         id: inspect
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           # -e : stoppe au premier échec
           # -u : variable non définie = erreur
@@ -156,7 +175,8 @@ jobs:
 
           # Un membre d'orga garde l'accès même sans collab repo : le "revoke" serait un faux positif.
           # GitHub répond 404 à la fois pour « pas membre » et pour « membre privé vu par un non-owner ».
-          # On n'accepte donc un 404 qu'après avoir prouvé que le token est un owner actif,
+          # On n'accepte donc un 404 qu'après avoir prouvé que le token voit les appartenances
+          # (le lanceur, membre actif de l'équipe developers, doit répondre 200),
           # et seulement si les deux endpoints (memberships + members) répondent 404.
           # curl sans -L : un 302 (token pas reconnu comme membre) n'est pas suivi jusqu'à un autre statut.
           echo "::group::Appartenance à l'orga ${ORG}"
@@ -178,32 +198,19 @@ jobs:
             printf '%s' "${code}"
           }
 
-          token_body="$(mktemp)"
-          token_code="$(github_status GET "https://api.github.com/user" "${token_body}")"
-          if [[ "${token_code}" != "200" ]]; then
-            echo "::error::Impossible d'identifier le compte du token (HTTP ${token_code}). Arrêt : sans owner confirmé, un 404 membre serait ambigu."
-            cat "${token_body}"
-            rm -f "${token_body}"
+          # Témoin : le lanceur est membre actif de l'orga (vérifié au step « Check caller »).
+          # Si le token ne le voit pas (200 + state active), il ne voit pas les membres privés
+          # et un 404 sur le candidat serait ambigu : on s'arrête.
+          witness_body="$(mktemp)"
+          witness_code="$(github_status GET "https://api.github.com/orgs/${ORG}/memberships/${ACTOR}" "${witness_body}")"
+          witness_state="$(jq -r '.state // empty' "${witness_body}" 2>/dev/null || true)"
+          rm -f "${witness_body}"
+          if [[ "${witness_code}" != "200" || "${witness_state}" != "active" ]]; then
+            echo "::error::Le token ne voit pas l'appartenance de ${ACTOR} à ${ORG} (HTTP ${witness_code}, state=${witness_state:-inconnu})."
+            echo "::error::Refus de continuer : un membre privé répondrait 404 et pourrait être traité comme un candidat. Vérifier la permission « Members: read » de l'App."
             exit 1
           fi
-          token_login="$(jq -r '.login // empty' "${token_body}")"
-          rm -f "${token_body}"
-          if [[ -z "${token_login}" ]]; then
-            echo "::error::Le token n'a pas de login utilisateur. Arrêt."
-            exit 1
-          fi
-
-          owner_body="$(mktemp)"
-          owner_code="$(github_status GET "https://api.github.com/orgs/${ORG}/memberships/${token_login}" "${owner_body}")"
-          owner_role="$(jq -r '.role // empty' "${owner_body}" 2>/dev/null || true)"
-          owner_state="$(jq -r '.state // empty' "${owner_body}" 2>/dev/null || true)"
-          rm -f "${owner_body}"
-          if [[ "${owner_code}" != "200" || "${owner_role}" != "admin" || "${owner_state}" != "active" ]]; then
-            echo "::error::Le token (${token_login}) n'est pas un owner actif de ${ORG} (HTTP ${owner_code}, role=${owner_role:-inconnu}, state=${owner_state:-inconnu})."
-            echo "::error::Refus de continuer : un membre privé répondrait 404 et pourrait être traité comme un candidat."
-            exit 1
-          fi
-          echo "Token ${token_login} : owner actif de ${ORG}."
+          echo "Token OK : il voit les appartenances à ${ORG} (témoin ${ACTOR})."
 
           membership_body="$(mktemp)"
           membership_code="$(github_status GET "https://api.github.com/orgs/${ORG}/memberships/${USERNAME}" "${membership_body}")"
@@ -234,7 +241,7 @@ jobs:
             exit 1
           fi
 
-          echo "${USERNAME} n'est pas membre de ${ORG} (memberships=404 et members=404, token owner)."
+          echo "${USERNAME} n'est pas membre de ${ORG} (memberships=404 et members=404, token vérifié)."
           echo "::endgroup::"
 
           echo "::group::Accès au repo ${REPO}"
@@ -317,6 +324,8 @@ jobs:
       # Un échec ici ne bloque pas le retrait : le step suivant ignore le success() implicite.
       - name: Delete codespaces billed to org
         if: inputs.delete_codespaces
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -413,6 +422,8 @@ jobs:
       # steps.inspect.outcome == success : pas de retrait si le garde-fou orga / login a échoué ou a été sauté.
       - name: Remove collaborator and pending invitations
         if: ${{ !cancelled() && inputs.remove_collaborator && steps.inspect.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
