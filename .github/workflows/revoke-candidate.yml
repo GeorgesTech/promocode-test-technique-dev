@@ -47,14 +47,34 @@ jobs:
       REMOVE_COLLABORATOR: ${{ inputs.remove_collaborator }}
       DELETE_CODESPACES: ${{ inputs.delete_codespaces }}
       ACTOR: ${{ github.actor }}
+      # Re-vérifications après suppressions asynchrones (codespaces, retrait candidat).
+      RETRY_MAX: 3
+      RETRY_DELAY: 10
 
     steps:
-      # Allowlist à faire évoluer pour contenir l'ensemble des devs Indy
+      # Seuls les membres actifs de l'équipe GeorgesTech/developers peuvent lancer ce workflow.
       - name: Check caller is authorized
-        if: ${{ !contains(fromJSON('["ncaringi"]'), github.actor) }}
+        env:
+          AUTHORIZED_TEAM: developers
         run: |
-          echo "::error::${ACTOR} n'est pas autorisé à lancer ce workflow"
-          exit 1
+          set -euo pipefail
+          # GET /orgs/{org}/teams/{team_slug}/memberships/{username} — 200 + state, 404 si pas dans l'équipe.
+          # Une invitation non acceptée répond aussi 200 (state "pending") : on exige "active".
+          err="$(mktemp)"
+          if state="$(gh api "orgs/${ORG}/teams/${AUTHORIZED_TEAM}/memberships/${ACTOR}" --jq '.state' 2>"${err}")"; then
+            if [[ "${state}" != "active" ]]; then
+              echo "::error::${ACTOR} n'est pas membre actif de ${ORG}/${AUTHORIZED_TEAM} (state=${state})."
+              exit 1
+            fi
+            echo "${ACTOR} est membre actif de ${ORG}/${AUTHORIZED_TEAM}."
+          elif grep -Eqi 'HTTP 404|Not Found' "${err}"; then
+            echo "::error::${ACTOR} n'est pas autorisé à lancer ce workflow (hors équipe ${ORG}/${AUTHORIZED_TEAM})."
+            exit 1
+          else
+            echo "::error::Impossible de vérifier l'appartenance de ${ACTOR} à ${ORG}/${AUTHORIZED_TEAM}."
+            cat "${err}"
+            exit 1
+          fi
 
       # `gh auth status` : vérifie que GH_TOKEN est accepté par l'API pour pouvoir run la suite des steps.
       - name: Check token
@@ -188,7 +208,7 @@ jobs:
           membership_body="$(mktemp)"
           membership_code="$(github_status GET "https://api.github.com/orgs/${ORG}/memberships/${USERNAME}" "${membership_body}")"
           if [[ "${membership_code}" == "200" ]]; then
-            echo "${membership_body}" | jq '{state, role}'
+            jq '{state, role}' "${membership_body}"
             state="$(jq -r '.state' "${membership_body}")"
             role="$(jq -r '.role' "${membership_body}")"
             echo "::error::${USERNAME} est ${role} (${state}) de ${ORG}. Ce n'est pas un candidat outside collaborator — abort."
@@ -220,10 +240,10 @@ jobs:
           echo "::group::Accès au repo ${REPO}"
           is_collaborator=false
           err="$(mktemp)"
-          # GET /repos/{owner}/{repo}/collaborators/{username}/permission
-          # 200 + {permission, role_name} si collab, 404 sinon.
-          if perm_json="$(gh api "repos/${REPO}/collaborators/${USERNAME}/permission" 2>"${err}")"; then
-            echo "${perm_json}" | jq '{permission, role_name}'
+          # GET /repos/{owner}/{repo}/collaborators/{username} — 204 si collab, 404 sinon.
+          # Pas /permission : il répond 200 même sans accès (permission "none", ou "read" si repo public).
+          if gh api "repos/${REPO}/collaborators/${USERNAME}" >/dev/null 2>"${err}"; then
+            gh api "repos/${REPO}/collaborators/${USERNAME}/permission" --jq '{permission, role_name}' || true
             is_collaborator=true
           elif api_ok_or_not_found "${err}"; then
             echo "${USERNAME} n'est pas candidat de ${REPO} (déjà retiré, ou jamais ajouté)."
@@ -345,6 +365,10 @@ jobs:
             elif grep -Eqi 'HTTP 404|Not Found' "${err}"; then
               echo "Déjà absent (404) — on continue."
               already_gone=$((already_gone + 1))
+            elif grep -Eq 'HTTP 304' "${err}"; then
+              # gh api sort en erreur sur un 304 ; la relecture ci-dessous tranche.
+              echo "Non modifié (304), suppression sans doute déjà en cours — on continue."
+              already_gone=$((already_gone + 1))
             else
               echo "::error::Échec suppression de ${name}"
               cat "${err}"
@@ -357,12 +381,20 @@ jobs:
           echo "Bilan codespaces: ${deleted} supprimé(s), ${already_gone} déjà absent(s), ${failed} échec(s)."
 
           # Reliste : s'il reste un codespace au nom du candidat, la suppression n'a pas abouti.
-          leftover="$(
-            gh api --paginate "orgs/${ORG}/codespaces" \
-              --jq '.codespaces[]
-                    | select((.owner.login | ascii_downcase) == (env.USERNAME | ascii_downcase))
-                    | .name'
-          )" || fail_codespaces "Impossible de revérifier les Codespaces après suppression."
+          # Le DELETE répond 202 (asynchrone) : on laisse quelques essais avant de conclure.
+          for attempt in $(seq 1 "${RETRY_MAX}"); do
+            leftover="$(
+              gh api --paginate "orgs/${ORG}/codespaces" \
+                --jq '.codespaces[]
+                      | select((.owner.login | ascii_downcase) == (env.USERNAME | ascii_downcase))
+                      | .name'
+            )" || fail_codespaces "Impossible de revérifier les Codespaces après suppression."
+            [[ -z "${leftover}" ]] && break
+            if [[ "${attempt}" -lt "${RETRY_MAX}" ]]; then
+              echo "Codespaces encore listés (essai ${attempt}/${RETRY_MAX}), nouvel essai dans ${RETRY_DELAY}s."
+              sleep "${RETRY_DELAY}"
+            fi
+          done
           if [[ -n "${leftover}" || "${failed}" -ne 0 ]]; then
             if [[ -n "${leftover}" ]]; then
               echo "Codespaces encore présents après suppression:"
@@ -428,12 +460,10 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Retrait candidat"
-          # DELETE /repos/{owner}/{repo}/collaborators/{username}.
+          # DELETE /repos/{owner}/{repo}/collaborators/{username} — 204, sinon 403/422 (pas de 404 documenté).
           err="$(mktemp)"
           if gh api --method DELETE "repos/${REPO}/collaborators/${USERNAME}" >/dev/null 2>"${err}"; then
             echo "${USERNAME} retiré de ${REPO}."
-          elif grep -Eqi 'HTTP 404|Not Found' "${err}"; then
-            echo "${USERNAME} n'était pas candidat (404) — rien à retirer."
           else
             echo "::error::Échec du retrait candidat"
             cat "${err}"
@@ -443,8 +473,22 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Vérification accès"
+          # Le retrait est propagé en arrière-plan : un 204 juste après le DELETE n'est pas définitif.
           err="$(mktemp)"
-          if gh api "repos/${REPO}/collaborators/${USERNAME}/permission" >/dev/null 2>"${err}"; then
+          still_collaborator=false
+          for attempt in $(seq 1 "${RETRY_MAX}"); do
+            if gh api "repos/${REPO}/collaborators/${USERNAME}" >/dev/null 2>"${err}"; then
+              still_collaborator=true
+            else
+              still_collaborator=false
+              break
+            fi
+            if [[ "${attempt}" -lt "${RETRY_MAX}" ]]; then
+              echo "${USERNAME} encore listé comme candidat (essai ${attempt}/${RETRY_MAX}), nouvel essai dans ${RETRY_DELAY}s."
+              sleep "${RETRY_DELAY}"
+            fi
+          done
+          if [[ "${still_collaborator}" == "true" ]]; then
             echo "::error::${USERNAME} a encore un droit sur ${REPO} après le retrait."
             gh api "repos/${REPO}/collaborators/${USERNAME}/permission" --jq '{permission, role_name}' || true
             failed=$((failed + 1))
