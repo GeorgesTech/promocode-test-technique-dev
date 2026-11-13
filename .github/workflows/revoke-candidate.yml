@@ -10,7 +10,7 @@
 # et le lanceur est averti (le workflow reste en échec).
 #
 # Token : généré à chaque run par la GitHub App indy-candidate-cleanup
-# (APP_ID_CANDIDATE_CLEANUP / PRIVATE_KEY_CANDIDATE_CLEANUP), installée sur ce repo seulement.
+# (CLIENT_ID_CANDIDATE_CLEANUP / PRIVATE_KEY_CANDIDATE_CLEANUP), installée sur ce repo seulement.
 # Permissions de l'App : repo administration + codespaces (write), org members (read)
 # + organization codespaces (write). Le token dure 1 h et est révoqué en fin de job.
 # Un 404 « pas membre » n'est accepté qu'après avoir prouvé que le token voit les
@@ -60,7 +60,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.APP_ID_CANDIDATE_CLEANUP }}
+          client-id: ${{ vars.CLIENT_ID_CANDIDATE_CLEANUP }}
           private-key: ${{ secrets.PRIVATE_KEY_CANDIDATE_CLEANUP }}
           owner: GeorgesTech
           repositories: promocode-test-technique-dev
