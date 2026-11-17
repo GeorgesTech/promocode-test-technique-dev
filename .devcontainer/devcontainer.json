@@ -20,11 +20,11 @@
   "remoteEnv": {
     "PORT": "3000"
   },
-  "updateContentCommand": "npm ci && npm test",
+  "updateContentCommand": "npm install --no-package-lock && npm test",
   "postStartCommand": "bash .devcontainer/setup-claude-auth.sh",
   "customizations": {
     "vscode": {
-      "extensions": ["vitest.explorer"]
+      "extensions": ["vitest.explorer", "anthropic.claude-code"]
     }
   }
 }
